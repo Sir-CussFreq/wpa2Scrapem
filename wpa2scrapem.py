@@ -1,0 +1,105 @@
+import os
+import signal
+import sys
+import glob
+from scapy.all import sniff, rdpcap, EAP
+
+# Function to check if running as root
+def check_root_privileges():
+    if os.geteuid() != 0:
+        print("[ERROR] This script must be run as root or with sudo.")
+        sys.exit(1)
+
+# Function to turn on monitor mode on the specified interface
+def enable_monitor_mode(interface):
+    try:
+        command_prefix = "sudo " if os.geteuid() != 0 else ""
+        os.system(f"{command_prefix}ip link set {interface} down")
+        os.system(f"{command_prefix}iw {interface} set monitor control")
+        os.system(f"{command_prefix}ip link set {interface} up")
+        print(f"[INFO] Monitor mode enabled on {interface}")
+    except Exception as e:
+        print(f"[ERROR] Failed to enable monitor mode on {interface}: {e}")
+        sys.exit(1)
+
+# Function to restore managed mode on the interface
+def disable_monitor_mode(interface):
+    try:
+        command_prefix = "sudo " if os.geteuid() != 0 else ""
+        os.system(f"{command_prefix}ip link set {interface} down")
+        os.system(f"{command_prefix}iw {interface} set type managed")
+        os.system(f"{command_prefix}ip link set {interface} up")
+        print(f"[INFO] Managed mode restored on {interface}")
+    except Exception as e:
+        print(f"[ERROR] Failed to restore managed mode on {interface}: {e}")
+
+# Function to handle Ctrl-C and gracefully exit
+def signal_handler(sig, frame):
+    print("\n[INFO] Stopping packet capture and exiting.")
+    if interface:
+        disable_monitor_mode(interface)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# Function to parse EAP Identity packets and extract usernames
+def packet_handler(packet):
+    if packet.haslayer(EAP):
+        eap_layer = packet.getlayer(EAP)
+        if eap_layer.code == 2:  # EAP-Response
+            try:
+                identity = eap_layer.identity.decode()
+                if identity:
+                    print(f"[USERNAME] Found: {identity}")
+                    if args.output_file:
+                        with open(args.output_file, 'a') as file:
+                            file.write(identity + '\n')
+            except AttributeError:
+                print("[WARNING] Unable to extract identity from EAP packet")
+
+# Function to read and analyze PCAP files with wildcard support
+def read_pcap_files(pcap_pattern):
+    files = glob.glob(pcap_pattern)
+    if not files:
+        print(f"[ERROR] No PCAP files found matching the pattern: {pcap_pattern}")
+        sys.exit(1)
+
+    for pcap_file in files:
+        print(f"[INFO] Reading packets from {pcap_file}...")
+        packets = rdpcap(pcap_file)
+        filtered_packets = [pkt for pkt in packets if pkt.haslayer(EAP) and pkt[EAP].code == 2]  # Filter for EAP-Response packets
+        for packet in filtered_packets:
+            packet_handler(packet)
+
+# Command-line argument parsing
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="WPA2 Enterprise Recon Utility")
+    parser.add_argument("-i", "--interface", help="WiFi interface to use")
+    parser.add_argument("-e", "--essid", help="Filter for a specific ESSID")
+    parser.add_argument("-o", "--output-file", help="File to dump usernames")
+    parser.add_argument("-p", "--pcap", help="PCAP file or pattern (supports wildcards, e.g., '*.pcap')")
+    args = parser.parse_args()
+
+    interface = args.interface
+
+    # Check for root privileges if running live sniffing
+    if not args.pcap:
+        check_root_privileges()
+
+    if args.pcap:
+        # Read from the provided PCAP file or pattern with wildcard support
+        read_pcap_files(args.pcap)
+    else:
+        # Enable monitor mode on the interface
+        enable_monitor_mode(interface)
+
+        try:
+            # Start sniffing packets
+            sniff_packets(interface, args.essid)
+        except Exception as e:
+            print(f"[ERROR] An error occurred: {e}")
+        finally:
+            # Restore the interface to managed mode
+            disable_monitor_mode(interface)
+
